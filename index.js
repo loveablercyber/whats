@@ -432,6 +432,44 @@ app.post("/api/logout", checkApiKey, async (req, res) => {
   }
 });
 
+app.post("/api/reset-session", checkApiKey, async (req, res) => {
+  try {
+    console.log("Resetando sessão Baileys...");
+
+    latestQr = null;
+    connectionStatus = "resetting";
+
+    try {
+      if (sock?.ws) {
+        sock.ws.close();
+      }
+    } catch (error) {
+      console.log("Socket já estava fechado");
+    }
+
+    sock = null;
+
+    const { clearAuth } = await useMongoAuthState(getClientId());
+    await clearAuth();
+
+    connectionStatus = "starting";
+
+    await startBaileys();
+
+    res.json({
+      success: true,
+      message: "Sessão removida. Aguarde alguns segundos e abra o QR Code novamente."
+    });
+  } catch (error) {
+    console.error("Erro ao resetar sessão:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 async function bootstrap() {
   if (!process.env.MONGODB_URI) {
     throw new Error("MONGODB_URI não configurado");
