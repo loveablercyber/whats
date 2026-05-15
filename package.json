@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-api",
+  "version": "1.0.0",
+  "description": "API simples de WhatsApp com whatsapp-web.js e RemoteAuth",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "archiver": "^8.0.0",
+    "axios": "^1.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "fs-extra": "^11.3.5",
+    "mongoose": "^8.0.0",
+    "qrcode": "^1.5.3",
+    "unzipper": "^0.12.3",
+    "whatsapp-web.js": "^1.26.0",
+    "wwebjs-mongo": "^1.1.0"
+  }
+}
