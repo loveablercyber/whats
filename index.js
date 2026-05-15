@@ -92,23 +92,19 @@ async function startWhatsApp() {
   const store = new MongoStore({ mongoose });
 
   client = new Client({
-    authStrategy: new RemoteAuth({
-  store,
-  clientId: process.env.CLIENT_ID || "default",
-  dataPath: "./",
-  backupSyncIntervalMs: 300000,
-  rmMaxRetries: 5
-}),
-    puppeteer: {
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions"
-      ]
-    }
+  authStrategy: new RemoteAuth({
+    store,
+    clientId: process.env.CLIENT_ID || "default",
+    dataPath: "./",
+    backupSyncIntervalMs: 300000,
+    rmMaxRetries: 5
+  }),
+  puppeteer: puppeteerConfig
+});
+
+if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+  puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+}
   });
 
   client.on("qr", async (qr) => {
