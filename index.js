@@ -20,46 +20,6 @@ let connectionStatus = "starting";
 let lastReadyAt = null;
 let lastSessionSavedAt = null;
 
-app.get("/qr-public-test", (req, res) => {
-  if (!latestQr) {
-    return res.send(`
-      <html>
-        <head>
-          <meta http-equiv="refresh" content="5">
-        </head>
-        <body style="font-family: Arial; padding: 30px;">
-          <h2>QR Code indisponível</h2>
-          <p>Status atual: <strong>${connectionStatus}</strong></p>
-          <p>A página atualiza sozinha a cada 5 segundos.</p>
-        </body>
-      </html>
-    `);
-  }
-
-  res.send(`
-    <html>
-      <head>
-        <meta http-equiv="refresh" content="15">
-      </head>
-      <body style="font-family: Arial; padding: 30px;">
-        <h2>Escaneie o QR Code</h2>
-        <p>Status: <strong>${connectionStatus}</strong></p>
-        <img src="${latestQr}" style="width: 320px; height: 320px;" />
-        <p>Se não conectar, aguarde atualizar ou pressione F5.</p>
-      </body>
-    </html>
-  `);
-});
-
-
-
-
-
-
-
-
-
-
 function checkApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
 
@@ -80,7 +40,6 @@ function normalizeBrazilNumber(number) {
     return null;
   }
 
-  // Se vier sem DDI, adiciona Brasil 55
   if (clean.length === 10 || clean.length === 11) {
     return `55${clean}`;
   }
@@ -91,20 +50,30 @@ function normalizeBrazilNumber(number) {
 async function startWhatsApp() {
   const store = new MongoStore({ mongoose });
 
-  client = new Client({
-  authStrategy: new RemoteAuth({
-    store,
-    clientId: process.env.CLIENT_ID || "default",
-    dataPath: "./",
-    backupSyncIntervalMs: 300000,
-    rmMaxRetries: 5
-  }),
-  puppeteer: puppeteerConfig
-});
+  const puppeteerConfig = {
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-extensions"
+    ]
+  };
 
-if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-  puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-}
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  client = new Client({
+    authStrategy: new RemoteAuth({
+      store,
+      clientId: process.env.CLIENT_ID || "default",
+      dataPath: "./",
+      backupSyncIntervalMs: 300000,
+      rmMaxRetries: 5
+    }),
+    puppeteer: puppeteerConfig
   });
 
   client.on("qr", async (qr) => {
@@ -195,6 +164,9 @@ app.get("/api/qr-view", checkApiKey, (req, res) => {
   if (!latestQr) {
     return res.send(`
       <html>
+        <head>
+          <meta http-equiv="refresh" content="5">
+        </head>
         <body style="font-family: Arial; padding: 30px;">
           <h2>QR Code indisponível</h2>
           <p>Status atual: <strong>${connectionStatus}</strong></p>
@@ -206,6 +178,39 @@ app.get("/api/qr-view", checkApiKey, (req, res) => {
 
   res.send(`
     <html>
+      <head>
+        <meta http-equiv="refresh" content="10">
+      </head>
+      <body style="font-family: Arial; padding: 30px;">
+        <h2>Escaneie o QR Code</h2>
+        <p>Status: <strong>${connectionStatus}</strong></p>
+        <img src="${latestQr}" style="width: 320px; height: 320px;" />
+      </body>
+    </html>
+  `);
+});
+
+// Rota temporária para teste local. Remova antes de produção.
+app.get("/qr-public-test", (req, res) => {
+  if (!latestQr) {
+    return res.send(`
+      <html>
+        <head>
+          <meta http-equiv="refresh" content="5">
+        </head>
+        <body style="font-family: Arial; padding: 30px;">
+          <h2>QR Code indisponível</h2>
+          <p>Status atual: <strong>${connectionStatus}</strong></p>
+        </body>
+      </html>
+    `);
+  }
+
+  res.send(`
+    <html>
+      <head>
+        <meta http-equiv="refresh" content="10">
+      </head>
       <body style="font-family: Arial; padding: 30px;">
         <h2>Escaneie o QR Code</h2>
         <p>Status: <strong>${connectionStatus}</strong></p>
