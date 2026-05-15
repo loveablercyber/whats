@@ -5,20 +5,30 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const qrcode = require("qrcode");
 const axios = require("axios");
+const pino = require("pino");
+const { Boom } = require("@hapi/boom");
 
-const { Client, RemoteAuth } = require("whatsapp-web.js");
-const { MongoStore } = require("wwebjs-mongo");
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  initAuthCreds,
+  BufferJSON,
+  proto
+} = require("@whiskeysockets/baileys");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 
-let client = null;
+let sock = null;
 let latestQr = null;
 let connectionStatus = "starting";
 let lastReadyAt = null;
 let lastSessionSavedAt = null;
+let isStarting = false;
 
 function checkApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
@@ -47,117 +57,222 @@ function normalizeBrazilNumber(number) {
   return clean;
 }
 
-async function startWhatsApp() {
-  const store = new MongoStore({ mongoose });
-
-  const puppeteerConfig = {
-  headless: true,
-  args: [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-breakpad",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-default-apps",
-    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
-    "--disable-hang-monitor",
-    "--disable-ipc-flooding-protection",
-    "--disable-popup-blocking",
-    "--disable-prompt-on-repost",
-    "--disable-renderer-backgrounding",
-    "--disable-sync",
-    "--force-color-profile=srgb",
-    "--metrics-recording-only",
-    "--mute-audio",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--no-zygote",
-    "--single-process"
-  ]
-};
-
-if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-  puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+function getClientId() {
+  return process.env.CLIENT_ID || "default";
 }
 
-  client = new Client({
-    authStrategy: new RemoteAuth({
-      store,
-      clientId: process.env.CLIENT_ID || "default",
-      dataPath: "./",
-      backupSyncIntervalMs: 300000,
-      rmMaxRetries: 5
-    }),
-    puppeteer: puppeteerConfig
-  });
+function getAuthCollection() {
+  return mongoose.connection.collection("baileys_auth");
+}
 
-  client.on("qr", async (qr) => {
-    console.log("QR Code gerado");
-    latestQr = await qrcode.toDataURL(qr);
-    connectionStatus = "qr";
-  });
+async function useMongoAuthState(clientId) {
+  const collection = getAuthCollection();
 
-  client.on("authenticated", () => {
-    console.log("WhatsApp autenticado");
-    connectionStatus = "authenticated";
-  });
+  const keyPrefix = `baileys:${clientId}:`;
 
-  client.on("remote_session_saved", () => {
-    console.log("Sessão remota salva no MongoDB");
-    lastSessionSavedAt = new Date().toISOString();
-  });
+  const writeData = async (data, id) => {
+    await collection.updateOne(
+      { _id: `${keyPrefix}${id}` },
+      {
+        $set: {
+          data: JSON.stringify(data, BufferJSON.replacer),
+          updatedAt: new Date()
+        }
+      },
+      { upsert: true }
+    );
+  };
 
-  client.on("ready", () => {
-    console.log("WhatsApp pronto");
-    latestQr = null;
-    connectionStatus = "ready";
-    lastReadyAt = new Date().toISOString();
-  });
+  const readData = async (id) => {
+    const doc = await collection.findOne({ _id: `${keyPrefix}${id}` });
 
-  client.on("disconnected", (reason) => {
-    console.log("WhatsApp desconectado:", reason);
-    connectionStatus = "disconnected";
-  });
+    if (!doc || !doc.data) {
+      return null;
+    }
 
-  client.on("auth_failure", (message) => {
-    console.error("Falha de autenticação:", message);
-    connectionStatus = "auth_failure";
-  });
+    return JSON.parse(doc.data, BufferJSON.reviver);
+  };
 
-  client.on("message", async (message) => {
-    console.log("Mensagem recebida:", {
-      from: message.from,
-      body: message.body,
-      type: message.type
+  const removeData = async (id) => {
+    await collection.deleteOne({ _id: `${keyPrefix}${id}` });
+  };
+
+  const creds = (await readData("creds")) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+
+          await Promise.all(
+            ids.map(async (id) => {
+              let value = await readData(`${type}-${id}`);
+
+              if (type === "app-state-sync-key" && value) {
+                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+              }
+
+              data[id] = value;
+            })
+          );
+
+          return data;
+        },
+        set: async (data) => {
+          const tasks = [];
+
+          for (const category of Object.keys(data)) {
+            for (const id of Object.keys(data[category])) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+
+              if (value) {
+                tasks.push(writeData(value, key));
+              } else {
+                tasks.push(removeData(key));
+              }
+            }
+          }
+
+          await Promise.all(tasks);
+        }
+      }
+    },
+    saveCreds: async () => {
+      await writeData(creds, "creds");
+      lastSessionSavedAt = new Date().toISOString();
+      console.log("Sessão Baileys salva no MongoDB");
+    },
+    clearAuth: async () => {
+      await collection.deleteMany({
+        _id: { $regex: `^${keyPrefix}` }
+      });
+    }
+  };
+}
+
+async function startBaileys() {
+  if (isStarting) {
+    return;
+  }
+
+  isStarting = true;
+
+  try {
+    connectionStatus = "starting";
+
+    const clientId = getClientId();
+    const { state, saveCreds } = await useMongoAuthState(clientId);
+    const { version } = await fetchLatestBaileysVersion();
+
+    const logger = pino({
+      level: process.env.LOG_LEVEL || "silent"
     });
 
-    if (process.env.WEBHOOK_URL) {
-      try {
-        await axios.post(process.env.WEBHOOK_URL, {
-          from: message.from,
-          body: message.body,
-          type: message.type,
-          timestamp: message.timestamp,
-          hasMedia: message.hasMedia
-        });
-      } catch (error) {
-        console.error("Erro ao enviar webhook:", error.message);
-      }
-    }
-  });
+    sock = makeWASocket({
+      version,
+      printQRInTerminal: false,
+      logger,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
+      },
+      browser: ["Nextia WhatsApp API", "Chrome", "1.0.0"],
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false
+    });
 
-  await client.initialize();
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        console.log("QR Code gerado");
+        latestQr = await qrcode.toDataURL(qr);
+        connectionStatus = "qr";
+      }
+
+      if (connection === "open") {
+        console.log("WhatsApp conectado com Baileys");
+        latestQr = null;
+        connectionStatus = "ready";
+        lastReadyAt = new Date().toISOString();
+      }
+
+      if (connection === "close") {
+        const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+
+        console.log("Conexão fechada:", statusCode);
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          connectionStatus = "logged_out";
+          latestQr = null;
+          console.log("Sessão deslogada. Será necessário novo QR Code.");
+          return;
+        }
+
+        connectionStatus = "reconnecting";
+        latestQr = null;
+
+        setTimeout(() => {
+          isStarting = false;
+          startBaileys().catch((error) => {
+            console.error("Erro ao reconectar:", error);
+          });
+        }, 5000);
+      }
+    });
+
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+      const message = messages?.[0];
+
+      if (!message || !message.message) {
+        return;
+      }
+
+      const from = message.key.remoteJid;
+      const isFromMe = message.key.fromMe;
+
+      const text =
+        message.message.conversation ||
+        message.message.extendedTextMessage?.text ||
+        message.message.imageMessage?.caption ||
+        message.message.videoMessage?.caption ||
+        "";
+
+      console.log("Mensagem recebida:", {
+        from,
+        isFromMe,
+        text
+      });
+
+      if (!isFromMe && process.env.WEBHOOK_URL) {
+        try {
+          await axios.post(process.env.WEBHOOK_URL, {
+            from,
+            text,
+            isFromMe,
+            timestamp: message.messageTimestamp,
+            raw: message
+          });
+        } catch (error) {
+          console.error("Erro ao enviar webhook:", error.message);
+        }
+      }
+    });
+  } finally {
+    isStarting = false;
+  }
 }
 
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "WhatsApp API online",
+    message: "WhatsApp API Baileys online",
     status: connectionStatus
   });
 });
@@ -165,6 +280,7 @@ app.get("/", (req, res) => {
 app.get("/api/status", checkApiKey, (req, res) => {
   res.json({
     success: true,
+    engine: "baileys",
     status: connectionStatus,
     lastReadyAt,
     lastSessionSavedAt,
@@ -210,7 +326,7 @@ app.get("/api/qr-view", checkApiKey, (req, res) => {
   `);
 });
 
-// Rota temporária para teste local. Remova antes de produção.
+// Rota pública temporária para teste. Remova depois de conectar.
 app.get("/qr-public-test", (req, res) => {
   if (!latestQr) {
     return res.send(`
@@ -251,7 +367,7 @@ app.post("/api/send-text", checkApiKey, async (req, res) => {
       });
     }
 
-    if (!client || connectionStatus !== "ready") {
+    if (!sock || connectionStatus !== "ready") {
       return res.status(503).json({
         success: false,
         error: "WhatsApp ainda não está conectado",
@@ -268,14 +384,17 @@ app.post("/api/send-text", checkApiKey, async (req, res) => {
       });
     }
 
-    const chatId = `${normalizedNumber}@c.us`;
+    const jid = `${normalizedNumber}@s.whatsapp.net`;
 
-    const result = await client.sendMessage(chatId, text);
+    const result = await sock.sendMessage(jid, {
+      text
+    });
 
     res.json({
       success: true,
       number: normalizedNumber,
-      messageId: result.id?._serialized || null
+      jid,
+      messageId: result?.key?.id || null
     });
   } catch (error) {
     console.error("Erro ao enviar mensagem:", error);
@@ -289,21 +408,19 @@ app.post("/api/send-text", checkApiKey, async (req, res) => {
 
 app.post("/api/logout", checkApiKey, async (req, res) => {
   try {
-    if (!client) {
-      return res.status(400).json({
-        success: false,
-        error: "Cliente WhatsApp não inicializado"
-      });
+    if (sock) {
+      await sock.logout();
     }
 
-    await client.logout();
+    const { clearAuth } = await useMongoAuthState(getClientId());
+    await clearAuth();
 
     latestQr = null;
     connectionStatus = "logged_out";
 
     res.json({
       success: true,
-      message: "WhatsApp desconectado"
+      message: "WhatsApp desconectado e sessão removida"
     });
   } catch (error) {
     console.error("Erro ao desconectar:", error);
@@ -328,7 +445,7 @@ async function bootstrap() {
 
   console.log("MongoDB conectado");
 
-  await startWhatsApp();
+  await startBaileys();
 
   const port = process.env.PORT || 3000;
 
