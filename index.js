@@ -79,6 +79,64 @@ function resolveRecipientJid(number) {
   };
 }
 
+function cleanString(value) {
+  return String(value || "").trim();
+}
+
+function isPublicHttpUrl(value) {
+  try {
+    const url = new URL(cleanString(value));
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function resolveMediaPayload(body) {
+  const mediaType = cleanString(body.mediaType || body.type).toLowerCase();
+  const mediaUrl = cleanString(body.mediaUrl || body.url);
+  const caption = cleanString(body.caption);
+  const mimetype = cleanString(body.mimetype);
+
+  if (!["image", "video", "audio"].includes(mediaType)) {
+    return {
+      error: "mediaType deve ser image, video ou audio"
+    };
+  }
+
+  if (!isPublicHttpUrl(mediaUrl)) {
+    return {
+      error: "mediaUrl deve ser uma URL publica http/https"
+    };
+  }
+
+  if (mediaType === "image") {
+    return {
+      message: {
+        image: { url: mediaUrl },
+        ...(caption ? { caption } : {})
+      }
+    };
+  }
+
+  if (mediaType === "video") {
+    return {
+      message: {
+        video: { url: mediaUrl },
+        ...(caption ? { caption } : {})
+      }
+    };
+  }
+
+  return {
+    message: {
+      audio: { url: mediaUrl },
+      mimetype: mimetype || "audio/mpeg",
+      ptt: Boolean(body.ptt)
+    }
+  };
+}
+
 function getClientId() {
   return process.env.CLIENT_ID || "default";
 }
@@ -418,6 +476,62 @@ app.post("/api/send-text", checkApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error("Erro ao enviar mensagem:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/api/send-media", checkApiKey, async (req, res) => {
+  try {
+    const { number } = req.body;
+
+    if (!number) {
+      return res.status(400).json({
+        success: false,
+        error: "number é obrigatório"
+      });
+    }
+
+    if (!sock || connectionStatus !== "ready") {
+      return res.status(503).json({
+        success: false,
+        error: "WhatsApp ainda não está conectado",
+        status: connectionStatus
+      });
+    }
+
+    const recipient = resolveRecipientJid(number);
+
+    if (!recipient) {
+      return res.status(400).json({
+        success: false,
+        error: "Número inválido"
+      });
+    }
+
+    const media = resolveMediaPayload(req.body);
+
+    if (media.error) {
+      return res.status(400).json({
+        success: false,
+        error: media.error
+      });
+    }
+
+    const result = await sock.sendMessage(recipient.jid, media.message);
+
+    res.json({
+      success: true,
+      number: recipient.number,
+      jid: recipient.jid,
+      mediaType: cleanString(req.body.mediaType || req.body.type).toLowerCase(),
+      messageId: result?.key?.id || null
+    });
+  } catch (error) {
+    console.error("Erro ao enviar mídia:", error);
 
     res.status(500).json({
       success: false,
