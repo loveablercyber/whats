@@ -57,6 +57,28 @@ function normalizeBrazilNumber(number) {
   return clean;
 }
 
+function resolveRecipientJid(number) {
+  const raw = String(number || "").trim();
+
+  if (/@(?:s\.whatsapp\.net|lid|g\.us)$/i.test(raw)) {
+    return {
+      number: raw.replace(/@(?:s\.whatsapp\.net|lid|g\.us)$/i, ""),
+      jid: raw
+    };
+  }
+
+  const normalizedNumber = normalizeBrazilNumber(raw);
+
+  if (!normalizedNumber) {
+    return null;
+  }
+
+  return {
+    number: normalizedNumber,
+    jid: `${normalizedNumber}@s.whatsapp.net`
+  };
+}
+
 function getClientId() {
   return process.env.CLIENT_ID || "default";
 }
@@ -375,25 +397,23 @@ app.post("/api/send-text", checkApiKey, async (req, res) => {
       });
     }
 
-    const normalizedNumber = normalizeBrazilNumber(number);
+    const recipient = resolveRecipientJid(number);
 
-    if (!normalizedNumber) {
+    if (!recipient) {
       return res.status(400).json({
         success: false,
         error: "Número inválido"
       });
     }
 
-    const jid = `${normalizedNumber}@s.whatsapp.net`;
-
-    const result = await sock.sendMessage(jid, {
+    const result = await sock.sendMessage(recipient.jid, {
       text
     });
 
     res.json({
       success: true,
-      number: normalizedNumber,
-      jid,
+      number: recipient.number,
+      jid: recipient.jid,
       messageId: result?.key?.id || null
     });
   } catch (error) {
