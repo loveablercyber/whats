@@ -123,6 +123,10 @@ function isSelfWebhookUrl(url) {
   );
 }
 
+function isLegacyWebhookUrl(url) {
+  return url.hostname.toLowerCase() === "carolsol.vercel.app";
+}
+
 function publicHttpUrl(value) {
   try {
     const url = new URL(cleanString(value));
@@ -151,6 +155,11 @@ function resolveWebhookUrl() {
 
   if (isSelfWebhookUrl(url)) {
     console.warn("WEBHOOK_URL aponta para a própria API Render; usando webhook do PWA.");
+    return fallback;
+  }
+
+  if (isLegacyWebhookUrl(url)) {
+    console.warn("WEBHOOK_URL aponta para domínio antigo do PWA; usando carolmobile.vercel.app.");
     return fallback;
   }
 
