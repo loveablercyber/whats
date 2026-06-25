@@ -90,6 +90,34 @@ function cleanString(value) {
   return String(value || "").trim();
 }
 
+function resolveWebhookUrl() {
+  const configured = cleanString(process.env.WEBHOOK_URL);
+  const fallback =
+    cleanString(process.env.PWA_WEBHOOK_URL) ||
+    "https://carolmobile.vercel.app/api/webhooks/baileys/carolsol";
+
+  if (!configured) {
+    return fallback;
+  }
+
+  try {
+    const url = new URL(configured);
+    const pointsToThisRenderService =
+      url.hostname === "whatsapp-api-tyd0.onrender.com" &&
+      url.pathname.includes("/api/webhooks/baileys");
+
+    if (pointsToThisRenderService) {
+      console.warn("WEBHOOK_URL aponta para a própria API; usando webhook do PWA.");
+      return fallback;
+    }
+  } catch {
+    console.warn("WEBHOOK_URL inválida; usando webhook do PWA.");
+    return fallback;
+  }
+
+  return configured;
+}
+
 function isPublicHttpUrl(value) {
   try {
     const url = new URL(cleanString(value));
@@ -385,9 +413,11 @@ async function startBaileys({ force = false } = {}) {
         text
       });
 
-      if (!isFromMe && process.env.WEBHOOK_URL) {
+      const webhookUrl = resolveWebhookUrl();
+
+      if (!isFromMe && webhookUrl) {
         try {
-          await axios.post(process.env.WEBHOOK_URL, {
+          await axios.post(webhookUrl, {
             from,
             text,
             isFromMe,
