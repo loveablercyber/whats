@@ -36,6 +36,9 @@ let lastPairingRequestedAt = null;
 let lastDisconnectReason = null;
 let lastDisconnectAt = null;
 let reconnectTimer = null;
+let connectedJid = null;
+let connectedNumber = null;
+let connectedName = null;
 
 function checkApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
@@ -102,6 +105,7 @@ let lastWebhookTarget = null;
 let lastWebhookStatus = null;
 let lastWebhookError = null;
 let lastUpsertCount = 0;
+let lastUpsertType = null;
 let recentWebhookEvents = [];
 
 function safeWebhookTarget(value) {
@@ -159,6 +163,21 @@ function jidPhoneCandidate(...values) {
     if (/^55\d{10,11}$/.test(number)) return number;
   }
   return "";
+}
+
+function jidToNumber(value) {
+  const jid = cleanString(value);
+  const number = jid.replace(/@.*/, "").replace(/:.*/, "").replace(/\D/g, "");
+  return /^55\d{10,11}$/.test(number) ? number : null;
+}
+
+function chatTypeFromJid(value) {
+  const jid = cleanString(value);
+  if (jid.endsWith("@g.us")) return "group";
+  if (jid === "status@broadcast") return "status";
+  if (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@c.us")) return "private";
+  if (jid.endsWith("@lid")) return "private_lid";
+  return jid ? "unknown" : "empty";
 }
 
 function isSelfWebhookUrl(url) {
@@ -229,6 +248,7 @@ function webhookDiagnostics() {
     lastWebhookStatus,
     lastWebhookError,
     lastUpsertCount,
+    lastUpsertType,
     recentEvents: recentWebhookEvents.map((event) => ({
       ...event,
       from: event.from ? safeJid(event.from) : null
@@ -485,6 +505,9 @@ async function startBaileys({ force = false } = {}) {
         lastDisconnectAt = null;
         connectionStatus = "ready";
         lastReadyAt = new Date().toISOString();
+        connectedJid = sock.user?.id || null;
+        connectedNumber = jidToNumber(connectedJid);
+        connectedName = sock.user?.name || sock.user?.verifiedName || null;
       }
 
       if (connection === "close") {
@@ -513,9 +536,10 @@ async function startBaileys({ force = false } = {}) {
       }
     });
 
-    sock.ev.on("messages.upsert", async ({ messages }) => {
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
       const batch = Array.isArray(messages) ? messages : [];
       lastUpsertCount = batch.length;
+      lastUpsertType = type || null;
 
       for (const message of batch) {
         if (!message || !message.message) {
@@ -527,6 +551,7 @@ async function startBaileys({ force = false } = {}) {
         const participant = message.key.participant || null;
         const text = extractMessageText(message.message);
         const phone = jidPhoneCandidate(from, participant);
+        const chatType = chatTypeFromJid(from);
 
         lastIncomingMessageAt = new Date().toISOString();
         lastIncomingFrom = from;
@@ -537,6 +562,7 @@ async function startBaileys({ force = false } = {}) {
           from,
           participant,
           isFromMe,
+          chatType,
           hasText: Boolean(text),
           text
         });
@@ -546,6 +572,10 @@ async function startBaileys({ force = false } = {}) {
         if (isFromMe || !webhookUrl) {
           pushWebhookEvent({
             from,
+            participant,
+            phone,
+            chatType,
+            type,
             isFromMe,
             hasText: Boolean(text),
             skipped: isFromMe ? "from_me" : "missing_webhook"
@@ -563,6 +593,8 @@ async function startBaileys({ force = false } = {}) {
             remoteJid: from,
             participant,
             phone,
+            chatType,
+            type,
             text,
             isFromMe,
             messageId: message.key.id || null,
@@ -573,6 +605,10 @@ async function startBaileys({ force = false } = {}) {
           lastWebhookStatus = response.status;
           pushWebhookEvent({
             from,
+            participant,
+            phone,
+            chatType,
+            type,
             isFromMe,
             hasText: Boolean(text),
             status: response.status
@@ -582,6 +618,10 @@ async function startBaileys({ force = false } = {}) {
           lastWebhookError = error.message;
           pushWebhookEvent({
             from,
+            participant,
+            phone,
+            chatType,
+            type,
             isFromMe,
             hasText: Boolean(text),
             status: lastWebhookStatus,
@@ -614,6 +654,10 @@ app.get("/api/status", checkApiKey, (req, res) => {
     success: true,
     engine: "baileys",
     status: connectionStatus,
+    phone_number: connectedNumber,
+    number: connectedNumber,
+    account_name: connectedName,
+    connectedJid,
     lastReadyAt,
     lastSessionSavedAt,
     lastQrGeneratedAt,
