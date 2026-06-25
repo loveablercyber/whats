@@ -90,32 +90,89 @@ function cleanString(value) {
   return String(value || "").trim();
 }
 
+const DEFAULT_PWA_WEBHOOK_URL =
+  "https://carolmobile.vercel.app/api/webhooks/baileys/carolsol";
+
+let lastIncomingMessageAt = null;
+let lastIncomingFrom = null;
+let lastIncomingFromMe = null;
+let lastIncomingHasText = null;
+let lastWebhookAttemptAt = null;
+let lastWebhookTarget = null;
+let lastWebhookStatus = null;
+let lastWebhookError = null;
+
+function safeWebhookTarget(value) {
+  try {
+    const url = new URL(cleanString(value));
+    return {
+      host: url.hostname,
+      path: url.pathname,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isSelfWebhookUrl(url) {
+  const renderHost = cleanString(process.env.RENDER_EXTERNAL_HOSTNAME).toLowerCase();
+  const hostname = url.hostname.toLowerCase();
+  return (
+    hostname === "whatsapp-api-tyd0.onrender.com" ||
+    (renderHost && hostname === renderHost)
+  );
+}
+
+function publicHttpUrl(value) {
+  try {
+    const url = new URL(cleanString(value));
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
 function resolveWebhookUrl() {
   const configured = cleanString(process.env.WEBHOOK_URL);
   const fallback =
     cleanString(process.env.PWA_WEBHOOK_URL) ||
-    "https://carolmobile.vercel.app/api/webhooks/baileys/carolsol";
+    DEFAULT_PWA_WEBHOOK_URL;
 
   if (!configured) {
     return fallback;
   }
 
-  try {
-    const url = new URL(configured);
-    const pointsToThisRenderService =
-      url.hostname === "whatsapp-api-tyd0.onrender.com" &&
-      url.pathname.includes("/api/webhooks/baileys");
-
-    if (pointsToThisRenderService) {
-      console.warn("WEBHOOK_URL aponta para a própria API; usando webhook do PWA.");
-      return fallback;
-    }
-  } catch {
+  const url = publicHttpUrl(configured);
+  if (!url) {
     console.warn("WEBHOOK_URL inválida; usando webhook do PWA.");
     return fallback;
   }
 
+  if (isSelfWebhookUrl(url)) {
+    console.warn("WEBHOOK_URL aponta para a própria API Render; usando webhook do PWA.");
+    return fallback;
+  }
+
   return configured;
+}
+
+function webhookDiagnostics() {
+  const resolved = resolveWebhookUrl();
+  const configured = cleanString(process.env.WEBHOOK_URL);
+  return {
+    configured: Boolean(configured),
+    usingFallback: resolved !== configured,
+    target: safeWebhookTarget(resolved),
+    lastIncomingMessageAt,
+    lastIncomingFrom,
+    lastIncomingFromMe,
+    lastIncomingHasText,
+    lastWebhookAttemptAt,
+    lastWebhookTarget: safeWebhookTarget(lastWebhookTarget),
+    lastWebhookStatus,
+    lastWebhookError
+  };
 }
 
 function isPublicHttpUrl(value) {
@@ -407,6 +464,11 @@ async function startBaileys({ force = false } = {}) {
         message.message.videoMessage?.caption ||
         "";
 
+      lastIncomingMessageAt = new Date().toISOString();
+      lastIncomingFrom = from;
+      lastIncomingFromMe = Boolean(isFromMe);
+      lastIncomingHasText = Boolean(text);
+
       console.log("Mensagem recebida:", {
         from,
         isFromMe,
@@ -416,15 +478,22 @@ async function startBaileys({ force = false } = {}) {
       const webhookUrl = resolveWebhookUrl();
 
       if (!isFromMe && webhookUrl) {
+        lastWebhookAttemptAt = new Date().toISOString();
+        lastWebhookTarget = webhookUrl;
+        lastWebhookStatus = "pending";
+        lastWebhookError = null;
         try {
-          await axios.post(webhookUrl, {
+          const response = await axios.post(webhookUrl, {
             from,
             text,
             isFromMe,
             timestamp: message.messageTimestamp,
             raw: message
           });
+          lastWebhookStatus = response.status;
         } catch (error) {
+          lastWebhookStatus = error.response?.status || "error";
+          lastWebhookError = error.message;
           console.error("Erro ao enviar webhook:", error.message);
         }
       }
@@ -458,7 +527,8 @@ app.get("/api/status", checkApiKey, (req, res) => {
     lastPairingRequestedAt,
     lastDisconnectReason,
     lastDisconnectAt,
-    hasQr: Boolean(latestQr)
+    hasQr: Boolean(latestQr),
+    webhook: webhookDiagnostics()
   });
 });
 
