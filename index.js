@@ -15,8 +15,9 @@ const {
   makeCacheableSignalKeyStore,
   initAuthCreds,
   BufferJSON,
-  proto
-} = require("@whiskeysockets/baileys");
+  proto,
+  Browsers
+} = require("baileys");
 
 const app = express();
 
@@ -29,6 +30,12 @@ let connectionStatus = "starting";
 let lastReadyAt = null;
 let lastSessionSavedAt = null;
 let isStarting = false;
+let lastQrGeneratedAt = null;
+let lastPairingCode = null;
+let lastPairingRequestedAt = null;
+let lastDisconnectReason = null;
+let lastDisconnectAt = null;
+let reconnectTimer = null;
 
 function checkApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
@@ -141,6 +148,34 @@ function getClientId() {
   return process.env.CLIENT_ID || "default";
 }
 
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function closeSocket() {
+  try {
+    if (sock?.ws) {
+      sock.ws.close();
+    }
+  } catch (error) {
+    console.log("Socket já estava fechado");
+  }
+  sock = null;
+}
+
+function scheduleReconnect(delayMs = 5000) {
+  clearReconnectTimer();
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startBaileys({ force: true }).catch((error) => {
+      console.error("Erro ao reconectar:", error);
+    });
+  }, delayMs);
+}
+
 function getAuthCollection() {
   return mongoose.connection.collection("baileys_auth");
 }
@@ -233,15 +268,22 @@ async function useMongoAuthState(clientId) {
   };
 }
 
-async function startBaileys() {
+async function startBaileys({ force = false } = {}) {
   if (isStarting) {
     return;
   }
 
+  if (sock && !force && connectionStatus !== "logged_out") {
+    return;
+  }
+
   isStarting = true;
+  clearReconnectTimer();
 
   try {
     connectionStatus = "starting";
+    lastPairingCode = null;
+    lastPairingRequestedAt = null;
 
     const clientId = getClientId();
     const { state, saveCreds } = await useMongoAuthState(clientId);
@@ -259,10 +301,13 @@ async function startBaileys() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
-      browser: ["Nextia WhatsApp API", "Chrome", "1.0.0"],
+      browser: Browsers.ubuntu("Chrome"),
       markOnlineOnConnect: false,
       syncFullHistory: false,
-      generateHighQualityLinkPreview: false
+      generateHighQualityLinkPreview: false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -273,37 +318,47 @@ async function startBaileys() {
       if (qr) {
         console.log("QR Code gerado");
         latestQr = await qrcode.toDataURL(qr);
+        lastQrGeneratedAt = new Date().toISOString();
+        lastPairingCode = null;
+        lastPairingRequestedAt = null;
         connectionStatus = "qr";
       }
 
       if (connection === "open") {
         console.log("WhatsApp conectado com Baileys");
         latestQr = null;
+        lastQrGeneratedAt = null;
+        lastPairingCode = null;
+        lastPairingRequestedAt = null;
+        lastDisconnectReason = null;
+        lastDisconnectAt = null;
         connectionStatus = "ready";
         lastReadyAt = new Date().toISOString();
       }
 
       if (connection === "close") {
         const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+        lastDisconnectReason = statusCode || "unknown";
+        lastDisconnectAt = new Date().toISOString();
 
         console.log("Conexão fechada:", statusCode);
 
         if (statusCode === DisconnectReason.loggedOut) {
           connectionStatus = "logged_out";
           latestQr = null;
+          lastQrGeneratedAt = null;
+          lastPairingCode = null;
+          lastPairingRequestedAt = null;
+          sock = null;
           console.log("Sessão deslogada. Será necessário novo QR Code.");
           return;
         }
 
         connectionStatus = "reconnecting";
         latestQr = null;
+        sock = null;
 
-        setTimeout(() => {
-          isStarting = false;
-          startBaileys().catch((error) => {
-            console.error("Erro ao reconectar:", error);
-          });
-        }, 5000);
+        scheduleReconnect(statusCode === DisconnectReason.restartRequired ? 500 : 5000);
       }
     });
 
@@ -344,6 +399,11 @@ async function startBaileys() {
         }
       }
     });
+  } catch (error) {
+    connectionStatus = "error";
+    lastDisconnectReason = error.message;
+    lastDisconnectAt = new Date().toISOString();
+    throw error;
   } finally {
     isStarting = false;
   }
@@ -364,6 +424,10 @@ app.get("/api/status", checkApiKey, (req, res) => {
     status: connectionStatus,
     lastReadyAt,
     lastSessionSavedAt,
+    lastQrGeneratedAt,
+    lastPairingRequestedAt,
+    lastDisconnectReason,
+    lastDisconnectAt,
     hasQr: Boolean(latestQr)
   });
 });
@@ -374,6 +438,60 @@ app.get("/api/qr", checkApiKey, (req, res) => {
     status: connectionStatus,
     qr: latestQr
   });
+});
+
+app.post("/api/pairing-code", checkApiKey, async (req, res) => {
+  try {
+    const number = normalizeBrazilNumber(req.body?.number);
+
+    if (!/^55\d{10,11}$/.test(number || "")) {
+      return res.status(400).json({
+        success: false,
+        error: "Informe o telefone com 55, DDD e número."
+      });
+    }
+
+    if (connectionStatus === "ready") {
+      return res.status(409).json({
+        success: false,
+        error: "WhatsApp já está conectado",
+        status: connectionStatus
+      });
+    }
+
+    if (!sock || ["logged_out", "error"].includes(connectionStatus)) {
+      await startBaileys({ force: true });
+    }
+
+    if (!sock?.requestPairingCode) {
+      return res.status(503).json({
+        success: false,
+        error: "Esta versão do Baileys não suporta código de pareamento",
+        status: connectionStatus
+      });
+    }
+
+    const code = await sock.requestPairingCode(number);
+    lastPairingCode = code;
+    lastPairingRequestedAt = new Date().toISOString();
+    connectionStatus = "pairing_code";
+
+    res.json({
+      success: true,
+      status: connectionStatus,
+      number,
+      pairingCode: code,
+      requestedAt: lastPairingRequestedAt
+    });
+  } catch (error) {
+    console.error("Erro ao gerar código de pareamento:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      status: connectionStatus
+    });
+  }
 });
 
 app.get("/api/qr-view", checkApiKey, (req, res) => {
@@ -542,6 +660,8 @@ app.post("/api/send-media", checkApiKey, async (req, res) => {
 
 app.post("/api/logout", checkApiKey, async (req, res) => {
   try {
+    clearReconnectTimer();
+
     if (sock) {
       await sock.logout();
     }
@@ -550,6 +670,12 @@ app.post("/api/logout", checkApiKey, async (req, res) => {
     await clearAuth();
 
     latestQr = null;
+    lastQrGeneratedAt = null;
+    lastPairingCode = null;
+    lastPairingRequestedAt = null;
+    lastDisconnectReason = null;
+    lastDisconnectAt = null;
+    sock = null;
     connectionStatus = "logged_out";
 
     res.json({
@@ -570,13 +696,17 @@ app.post("/api/reset-session", checkApiKey, async (req, res) => {
   try {
     console.log("Resetando sessão Baileys...");
 
+    clearReconnectTimer();
     latestQr = null;
+    lastQrGeneratedAt = null;
+    lastPairingCode = null;
+    lastPairingRequestedAt = null;
+    lastDisconnectReason = null;
+    lastDisconnectAt = null;
     connectionStatus = "resetting";
 
     try {
-      if (sock?.ws) {
-        sock.ws.close();
-      }
+      closeSocket();
     } catch (error) {
       console.log("Socket já estava fechado");
     }
@@ -588,7 +718,7 @@ app.post("/api/reset-session", checkApiKey, async (req, res) => {
 
     connectionStatus = "starting";
 
-    await startBaileys();
+    await startBaileys({ force: true });
 
     res.json({
       success: true,

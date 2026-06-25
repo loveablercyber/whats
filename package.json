@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-api",
   "version": "1.0.0",
-  "description": "API simples de WhatsApp com whatsapp-web.js e RemoteAuth",
+  "description": "API simples de WhatsApp com Baileys e autenticação remota",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -9,13 +9,16 @@
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.17.16",
     "axios": "^1.16.1",
+    "baileys": "7.0.0-rc13",
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^4.22.2",
     "mongoose": "^8.24.0",
     "pino": "^10.3.1",
     "qrcode": "^1.5.4"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
