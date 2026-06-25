@@ -101,6 +101,8 @@ let lastWebhookAttemptAt = null;
 let lastWebhookTarget = null;
 let lastWebhookStatus = null;
 let lastWebhookError = null;
+let lastUpsertCount = 0;
+let recentWebhookEvents = [];
 
 function safeWebhookTarget(value) {
   try {
@@ -112,6 +114,51 @@ function safeWebhookTarget(value) {
   } catch {
     return null;
   }
+}
+
+function pushWebhookEvent(event) {
+  recentWebhookEvents = [
+    {
+      at: new Date().toISOString(),
+      ...event
+    },
+    ...recentWebhookEvents
+  ].slice(0, 10);
+}
+
+function messageContent(message) {
+  if (!message) return {};
+  if (message.ephemeralMessage?.message) return messageContent(message.ephemeralMessage.message);
+  if (message.viewOnceMessage?.message) return messageContent(message.viewOnceMessage.message);
+  if (message.viewOnceMessageV2?.message) return messageContent(message.viewOnceMessageV2.message);
+  if (message.documentWithCaptionMessage?.message) return messageContent(message.documentWithCaptionMessage.message);
+  return message;
+}
+
+function extractMessageText(message) {
+  const content = messageContent(message);
+  return cleanString(
+    content.conversation ||
+      content.extendedTextMessage?.text ||
+      content.imageMessage?.caption ||
+      content.videoMessage?.caption ||
+      content.documentMessage?.caption ||
+      content.buttonsResponseMessage?.selectedDisplayText ||
+      content.listResponseMessage?.title ||
+      content.templateButtonReplyMessage?.selectedDisplayText ||
+      content.interactiveResponseMessage?.body?.text ||
+      ""
+  );
+}
+
+function jidPhoneCandidate(...values) {
+  for (const value of values) {
+    const jid = cleanString(value);
+    if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") continue;
+    const number = jid.replace(/@(?:s\.whatsapp\.net|c\.us|broadcast)$/i, "").replace(/\D/g, "");
+    if (/^55\d{10,11}$/.test(number)) return number;
+  }
+  return "";
 }
 
 function isSelfWebhookUrl(url) {
@@ -180,8 +227,18 @@ function webhookDiagnostics() {
     lastWebhookAttemptAt,
     lastWebhookTarget: safeWebhookTarget(lastWebhookTarget),
     lastWebhookStatus,
-    lastWebhookError
+    lastWebhookError,
+    lastUpsertCount,
+    recentEvents: recentWebhookEvents.map((event) => ({
+      ...event,
+      from: event.from ? safeJid(event.from) : null
+    }))
   };
+}
+
+function safeJid(value) {
+  const text = cleanString(value);
+  return text.replace(/\d(?=\d{4})/g, "•");
 }
 
 function isPublicHttpUrl(value) {
@@ -457,36 +514,45 @@ async function startBaileys({ force = false } = {}) {
     });
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
-      const message = messages?.[0];
+      const batch = Array.isArray(messages) ? messages : [];
+      lastUpsertCount = batch.length;
 
-      if (!message || !message.message) {
-        return;
-      }
+      for (const message of batch) {
+        if (!message || !message.message) {
+          continue;
+        }
 
-      const from = message.key.remoteJid;
-      const isFromMe = message.key.fromMe;
+        const from = message.key.remoteJid;
+        const isFromMe = Boolean(message.key.fromMe);
+        const participant = message.key.participant || null;
+        const text = extractMessageText(message.message);
+        const phone = jidPhoneCandidate(from, participant);
 
-      const text =
-        message.message.conversation ||
-        message.message.extendedTextMessage?.text ||
-        message.message.imageMessage?.caption ||
-        message.message.videoMessage?.caption ||
-        "";
+        lastIncomingMessageAt = new Date().toISOString();
+        lastIncomingFrom = from;
+        lastIncomingFromMe = isFromMe;
+        lastIncomingHasText = Boolean(text);
 
-      lastIncomingMessageAt = new Date().toISOString();
-      lastIncomingFrom = from;
-      lastIncomingFromMe = Boolean(isFromMe);
-      lastIncomingHasText = Boolean(text);
+        console.log("Mensagem recebida:", {
+          from,
+          participant,
+          isFromMe,
+          hasText: Boolean(text),
+          text
+        });
 
-      console.log("Mensagem recebida:", {
-        from,
-        isFromMe,
-        text
-      });
+        const webhookUrl = resolveWebhookUrl();
 
-      const webhookUrl = resolveWebhookUrl();
+        if (isFromMe || !webhookUrl) {
+          pushWebhookEvent({
+            from,
+            isFromMe,
+            hasText: Boolean(text),
+            skipped: isFromMe ? "from_me" : "missing_webhook"
+          });
+          continue;
+        }
 
-      if (!isFromMe && webhookUrl) {
         lastWebhookAttemptAt = new Date().toISOString();
         lastWebhookTarget = webhookUrl;
         lastWebhookStatus = "pending";
@@ -494,15 +560,33 @@ async function startBaileys({ force = false } = {}) {
         try {
           const response = await axios.post(webhookUrl, {
             from,
+            remoteJid: from,
+            participant,
+            phone,
             text,
             isFromMe,
+            messageId: message.key.id || null,
+            pushName: message.pushName || null,
             timestamp: message.messageTimestamp,
             raw: message
           });
           lastWebhookStatus = response.status;
+          pushWebhookEvent({
+            from,
+            isFromMe,
+            hasText: Boolean(text),
+            status: response.status
+          });
         } catch (error) {
           lastWebhookStatus = error.response?.status || "error";
           lastWebhookError = error.message;
+          pushWebhookEvent({
+            from,
+            isFromMe,
+            hasText: Boolean(text),
+            status: lastWebhookStatus,
+            error: error.message
+          });
           console.error("Erro ao enviar webhook:", error.message);
         }
       }
