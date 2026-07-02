@@ -42,6 +42,34 @@ let connectedName = null;
 let activeWaVersion = null;
 let waVersionIsLatest = null;
 const baileysPairingFix = "PR2559@834dc742";
+const pairingRateLimitCooldownMs = Math.max(
+  60_000,
+  Number(process.env.PAIRING_RATE_LIMIT_COOLDOWN_MS || 30 * 60 * 1000)
+);
+const pairingMinIntervalMs = Math.max(
+  30_000,
+  Number(process.env.PAIRING_MIN_INTERVAL_MS || 60_000)
+);
+let pairingBlockedUntil = null;
+let lastPairingError = null;
+let lastPairingErrorAt = null;
+
+function pairingRetryAfterSeconds() {
+  if (!pairingBlockedUntil) return 0;
+  return Math.max(0, Math.ceil((Date.parse(pairingBlockedUntil) - Date.now()) / 1000));
+}
+
+function pairingRateLimitPayload(retryAfterSeconds = pairingRetryAfterSeconds()) {
+  const minutes = Math.max(1, Math.ceil(retryAfterSeconds / 60));
+  return {
+    success: false,
+    code: "PAIRING_RATE_LIMITED",
+    error: `O WhatsApp bloqueou temporariamente novas tentativas. Aguarde ${minutes} minuto(s) antes de gerar outro código.`,
+    retryAfterSeconds,
+    retryAt: pairingBlockedUntil,
+    status: connectionStatus
+  };
+}
 
 function checkApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
@@ -517,6 +545,9 @@ async function startBaileys({ force = false } = {}) {
         connectedJid = sock.user?.id || null;
         connectedNumber = jidToNumber(connectedJid);
         connectedName = sock.user?.name || sock.user?.verifiedName || null;
+        pairingBlockedUntil = null;
+        lastPairingError = null;
+        lastPairingErrorAt = null;
       }
 
       if (connection === "close") {
@@ -673,6 +704,10 @@ app.get("/api/status", checkApiKey, (req, res) => {
     activeWaVersion,
     waVersionIsLatest,
     baileysPairingFix,
+    pairingBlockedUntil,
+    pairingRetryAfterSeconds: pairingRetryAfterSeconds(),
+    lastPairingError,
+    lastPairingErrorAt,
     lastReadyAt,
     lastSessionSavedAt,
     lastQrGeneratedAt,
@@ -694,6 +729,27 @@ app.get("/api/qr", checkApiKey, (req, res) => {
 
 app.post("/api/pairing-code", checkApiKey, async (req, res) => {
   try {
+    const activeRetryAfter = pairingRetryAfterSeconds();
+    if (activeRetryAfter > 0) {
+      res.set("Retry-After", String(activeRetryAfter));
+      return res.status(429).json(pairingRateLimitPayload(activeRetryAfter));
+    }
+
+    if (lastPairingRequestedAt) {
+      const elapsed = Date.now() - Date.parse(lastPairingRequestedAt);
+      if (elapsed >= 0 && elapsed < pairingMinIntervalMs) {
+        const retryAfter = Math.ceil((pairingMinIntervalMs - elapsed) / 1000);
+        res.set("Retry-After", String(retryAfter));
+        return res.status(429).json({
+          success: false,
+          code: "PAIRING_REQUEST_TOO_SOON",
+          error: `Já existe um código recente. Aguarde ${retryAfter} segundo(s) antes de solicitar outro.`,
+          retryAfterSeconds: retryAfter,
+          status: connectionStatus
+        });
+      }
+    }
+
     const number = normalizeBrazilNumber(req.body?.number);
 
     if (!/^55\d{10,11}$/.test(number || "")) {
@@ -726,6 +782,8 @@ app.post("/api/pairing-code", checkApiKey, async (req, res) => {
     const code = await sock.requestPairingCode(number);
     lastPairingCode = code;
     lastPairingRequestedAt = new Date().toISOString();
+    lastPairingError = null;
+    lastPairingErrorAt = null;
     connectionStatus = "pairing_code";
 
     res.json({
@@ -737,6 +795,23 @@ app.post("/api/pairing-code", checkApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error("Erro ao gerar código de pareamento:", error);
+
+    const statusCode =
+      error?.output?.statusCode ||
+      error?.data?.statusCode ||
+      new Boom(error)?.output?.statusCode;
+    const errorMessage = String(error?.message || error || "");
+    const rateLimited = statusCode === 429 || /rate[-_ ]?overlimit|too many|429/i.test(errorMessage);
+
+    lastPairingError = rateLimited ? "rate-overlimit" : errorMessage;
+    lastPairingErrorAt = new Date().toISOString();
+
+    if (rateLimited) {
+      pairingBlockedUntil = new Date(Date.now() + pairingRateLimitCooldownMs).toISOString();
+      const retryAfter = pairingRetryAfterSeconds();
+      res.set("Retry-After", String(retryAfter));
+      return res.status(429).json(pairingRateLimitPayload(retryAfter));
+    }
 
     res.status(500).json({
       success: false,
