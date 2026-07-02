@@ -11,7 +11,7 @@ const { Boom } = require("@hapi/boom");
 const {
   default: makeWASocket,
   DisconnectReason,
-  fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   initAuthCreds,
   BufferJSON,
@@ -39,6 +39,8 @@ let reconnectTimer = null;
 let connectedJid = null;
 let connectedNumber = null;
 let connectedName = null;
+let activeWaVersion = null;
+let waVersionIsLatest = null;
 
 function checkApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
@@ -458,7 +460,10 @@ async function startBaileys({ force = false } = {}) {
 
     const clientId = getClientId();
     const { state, saveCreds } = await useMongoAuthState(clientId);
-    const { version } = await fetchLatestBaileysVersion();
+    const { version, isLatest } = await fetchLatestWaWebVersion();
+    activeWaVersion = Array.isArray(version) ? version.join(".") : String(version || "");
+    waVersionIsLatest = Boolean(isLatest);
+    console.log("Versão atual do WhatsApp Web:", activeWaVersion, { isLatest: waVersionIsLatest });
 
     const logger = pino({
       level: process.env.LOG_LEVEL || "silent"
@@ -488,6 +493,9 @@ async function startBaileys({ force = false } = {}) {
 
       if (qr) {
         console.log("QR Code gerado");
+        connectedJid = null;
+        connectedNumber = null;
+        connectedName = null;
         latestQr = await qrcode.toDataURL(qr);
         lastQrGeneratedAt = new Date().toISOString();
         lastPairingCode = null;
@@ -524,6 +532,9 @@ async function startBaileys({ force = false } = {}) {
           lastPairingCode = null;
           lastPairingRequestedAt = null;
           sock = null;
+          connectedJid = null;
+          connectedNumber = null;
+          connectedName = null;
           console.log("Sessão deslogada. Será necessário novo QR Code.");
           return;
         }
@@ -658,6 +669,8 @@ app.get("/api/status", checkApiKey, (req, res) => {
     number: connectedNumber,
     account_name: connectedName,
     connectedJid,
+    activeWaVersion,
+    waVersionIsLatest,
     lastReadyAt,
     lastSessionSavedAt,
     lastQrGeneratedAt,
@@ -913,6 +926,9 @@ app.post("/api/logout", checkApiKey, async (req, res) => {
     lastDisconnectReason = null;
     lastDisconnectAt = null;
     sock = null;
+    connectedJid = null;
+    connectedNumber = null;
+    connectedName = null;
     connectionStatus = "logged_out";
 
     res.json({
@@ -949,6 +965,9 @@ app.post("/api/reset-session", checkApiKey, async (req, res) => {
     }
 
     sock = null;
+    connectedJid = null;
+    connectedNumber = null;
+    connectedName = null;
 
     const { clearAuth } = await useMongoAuthState(getClientId());
     await clearAuth();
