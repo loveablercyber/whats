@@ -10,7 +10,7 @@
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "axios": "^1.16.1",
-    "baileys": "7.0.0-rc13",
+    "baileys": "file:vendor/baileys-7.0.0-rc13-pr2559-834dc742.tgz",
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^4.22.2",

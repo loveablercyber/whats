@@ -41,6 +41,7 @@ let connectedNumber = null;
 let connectedName = null;
 let activeWaVersion = null;
 let waVersionIsLatest = null;
+const baileysPairingFix = "PR2559@834dc742";
 
 function checkApiKey(req, res, next) {
   const apiKey = req.headers["x-api-key"];
@@ -671,6 +672,7 @@ app.get("/api/status", checkApiKey, (req, res) => {
     connectedJid,
     activeWaVersion,
     waVersionIsLatest,
+    baileysPairingFix,
     lastReadyAt,
     lastSessionSavedAt,
     lastQrGeneratedAt,
